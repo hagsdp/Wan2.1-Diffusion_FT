@@ -13,6 +13,7 @@ import torch
 import torch.cuda.amp as amp
 import torch.distributed as dist
 from tqdm import tqdm
+import time
 
 from .distributed.fsdp import shard_model
 from .modules.model import WanModel
@@ -121,7 +122,8 @@ class WanT2V:
                  guide_scale=5.0,
                  n_prompt="",
                  seed=-1,
-                 offload_model=True):
+                 offload_model=True,
+                 profile: bool = False):
         r"""
         Generates video frames from text prompt using diffusion process.
 
@@ -225,6 +227,31 @@ class WanT2V:
                 raise NotImplementedError("Unsupported solver.")
 
             # sample videos
+            # Notes on performance (where time is spent):
+            # - Each iteration of the following `for` loop (the tqdm loop) performs the
+            #   heavy work of diffusion sampling. Concretely it runs:
+            #     1) (possible) model device transfer (`self.model.to(self.device)`) — expensive if moving
+            #        a large model between CPU/GPU per-step.
+            #     2) model forward for conditional context (heavy; transformer conv/attn blocks)
+            #     3) model forward for unconditional (heavy; often identical cost to (2))
+            #     4) guidance combine (cheap elementwise ops)
+            #     5) scheduler.step(...) (mostly arithmetic, negligible vs model forward)
+            #   The profiler below optionally measures these timings so you can identify
+            #   whether the model forwards or device transfers dominate runtime.
+
+            # Lightweight profiling containers (only if `profile=True`). We store per-step
+            # durations for each major sub-step and report averages at the end.
+            profile_stats = None
+            if profile:
+                profile_stats = {
+                    'model_to_device': [],
+                    'forward_cond': [],
+                    'forward_uncond': [],
+                    'guidance': [],
+                    'scheduler': [],
+                    'latents_update': [],
+                    'vae_decode': [],
+                }
             latents = noise
 
             arg_c = {'context': context, 'seq_len': seq_len}
@@ -236,29 +263,123 @@ class WanT2V:
 
                 timestep = torch.stack(timestep)
 
+                # 1) ensure model is on the target device — this may be a no-op if already on device.
+                if profile:
+                    t0 = time.perf_counter()
+                # keep the existing behavior (call .to every step) but measure it when profiling
                 self.model.to(self.device)
-                noise_pred_cond = self.model(
-                    latent_model_input, t=timestep, **arg_c)[0]
-                noise_pred_uncond = self.model(
-                    latent_model_input, t=timestep, **arg_null)[0]
+                if profile:
+                    # sync to get accurate GPU time measurements
+                    if torch.cuda.is_available() and self.device.type == 'cuda':
+                        torch.cuda.synchronize()
+                    profile_stats['model_to_device'].append(time.perf_counter() - t0)
 
+                # 2/3) batched conditional + unconditional forward (heavy)
+                # Build a batch of two identical latents and two contexts (cond, uncond)
+                # so we only call the model once per timestep. This reduces overhead
+                # and is safe because the model is stateless across these two calls.
+                if profile:
+                    t0 = time.perf_counter()
+
+                # duplicate latent tensor for batch-size=2
+                x0 = latent_model_input[0]
+                x_batch = [x0, x0]
+
+                # create timestep batch: repeat the single timestep twice
+                t_batch = timestep.repeat(2)
+
+                # prepare context batch: (cond, uncond)
+                # context objects are typically lists of tensors; extract the per-sample tensor
+                if isinstance(arg_c['context'], (list, tuple)):
+                    ctx_c = arg_c['context'][0]
+                else:
+                    ctx_c = arg_c['context']
+                if isinstance(arg_null['context'], (list, tuple)):
+                    ctx_n = arg_null['context'][0]
+                else:
+                    ctx_n = arg_null['context']
+                context_batch = [ctx_c, ctx_n]
+
+                # single batched forward -> returns a list of two outputs
+                outs = self.model(x_batch, t=t_batch, context=context_batch, seq_len=seq_len)
+                noise_pred_cond = outs[0]
+                noise_pred_uncond = outs[1]
+
+                # respect offload_model semantics (move outputs to CPU if requested)
+                if offload_model:
+                    noise_pred_cond = noise_pred_cond.to(torch.device('cpu'))
+                    noise_pred_uncond = noise_pred_uncond.to(torch.device('cpu'))
+                else:
+                    noise_pred_cond = noise_pred_cond.to(self.device)
+                    noise_pred_uncond = noise_pred_uncond.to(self.device)
+
+                if profile:
+                    if torch.cuda.is_available() and self.device.type == 'cuda':
+                        torch.cuda.synchronize()
+                    t_elapsed = time.perf_counter() - t0
+                    # record batched time and also append to the per-role lists for compatibility
+                    profile_stats.setdefault('forward_batched', []).append(t_elapsed)
+                    profile_stats['forward_cond'].append(t_elapsed)
+                    profile_stats['forward_uncond'].append(t_elapsed)
+
+                # 4) guidance combine (cheap)
+                if profile:
+                    t0 = time.perf_counter()
                 noise_pred = noise_pred_uncond + guide_scale * (
                     noise_pred_cond - noise_pred_uncond)
+                if profile:
+                    if torch.cuda.is_available() and self.device.type == 'cuda':
+                        torch.cuda.synchronize()
+                    profile_stats['guidance'].append(time.perf_counter() - t0)
 
+                # 5) scheduler update: uses the model output to compute the previous latent
+                if profile:
+                    t0 = time.perf_counter()
                 temp_x0 = sample_scheduler.step(
                     noise_pred.unsqueeze(0),
                     t,
                     latents[0].unsqueeze(0),
                     return_dict=False,
                     generator=seed_g)[0]
+                if profile:
+                    if torch.cuda.is_available() and self.device.type == 'cuda':
+                        torch.cuda.synchronize()
+                    profile_stats['scheduler'].append(time.perf_counter() - t0)
+
+                # update latents (very cheap)
+                if profile:
+                    t0 = time.perf_counter()
                 latents = [temp_x0.squeeze(0)]
+                if profile:
+                    profile_stats['latents_update'].append(time.perf_counter() - t0)
 
             x0 = latents
             if offload_model:
                 self.model.cpu()
                 torch.cuda.empty_cache()
+            # measure VAE decode time when profiling
+            if profile:
+                t0 = time.perf_counter()
             if self.rank == 0:
                 videos = self.vae.decode(x0)
+            if profile:
+                if torch.cuda.is_available() and self.device.type == 'cuda':
+                    torch.cuda.synchronize()
+                profile_stats['vae_decode'].append(time.perf_counter() - t0)
+
+            # report profiling summary (on rank 0)
+            if profile and self.rank == 0:
+                def _avg(l):
+                    return float(sum(l) / len(l)) if len(l) > 0 else 0.0
+
+                logging.info("Profiling summary (per-step averages in seconds):")
+                logging.info(f" model_to_device: {_avg(profile_stats['model_to_device']):.6f}")
+                logging.info(f" forward_cond: {_avg(profile_stats['forward_cond']):.6f}")
+                logging.info(f" forward_uncond: {_avg(profile_stats['forward_uncond']):.6f}")
+                logging.info(f" guidance: {_avg(profile_stats['guidance']):.6f}")
+                logging.info(f" scheduler: {_avg(profile_stats['scheduler']):.6f}")
+                logging.info(f" latents_update: {_avg(profile_stats['latents_update']):.6f}")
+                logging.info(f" vae_decode (total time): {sum(profile_stats['vae_decode']):.6f}")
 
         del noise, latents
         del sample_scheduler

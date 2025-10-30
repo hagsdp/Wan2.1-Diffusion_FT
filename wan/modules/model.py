@@ -4,6 +4,8 @@ import math
 import torch
 import torch.cuda.amp as amp
 import torch.nn as nn
+import time
+import logging
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 
@@ -127,7 +129,7 @@ class WanSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
-    def forward(self, x, seq_lens, grid_sizes, freqs):
+    def forward(self, x, seq_lens, grid_sizes, freqs, profile: bool = False):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
@@ -144,14 +146,28 @@ class WanSelfAttention(nn.Module):
             v = self.v(x).view(b, s, n, d)
             return q, k, v
 
+        # compute qkv
+        if profile:
+            t0 = time.perf_counter()
         q, k, v = qkv_fn(x)
+        if profile:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            logging.debug(f"WanSelfAttention: qkv time: {time.perf_counter()-t0:.6f}s")
 
+        # apply rotary + attention (heavy)
+        if profile:
+            t0 = time.perf_counter()
         x = flash_attention(
             q=rope_apply(q, grid_sizes, freqs),
             k=rope_apply(k, grid_sizes, freqs),
             v=v,
             k_lens=seq_lens,
             window_size=self.window_size)
+        if profile:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            logging.debug(f"WanSelfAttention: flash_attention time: {time.perf_counter()-t0:.6f}s")
 
         # output
         x = x.flatten(2)
@@ -161,7 +177,7 @@ class WanSelfAttention(nn.Module):
 
 class WanT2VCrossAttention(WanSelfAttention):
 
-    def forward(self, x, context, context_lens):
+    def forward(self, x, context, context_lens, profile: bool = False):
         r"""
         Args:
             x(Tensor): Shape [B, L1, C]
@@ -171,12 +187,24 @@ class WanT2VCrossAttention(WanSelfAttention):
         b, n, d = x.size(0), self.num_heads, self.head_dim
 
         # compute query, key, value
+        if profile:
+            t0 = time.perf_counter()
         q = self.norm_q(self.q(x)).view(b, -1, n, d)
         k = self.norm_k(self.k(context)).view(b, -1, n, d)
         v = self.v(context).view(b, -1, n, d)
+        if profile:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            logging.debug(f"WanT2VCrossAttention: qkv time: {time.perf_counter()-t0:.6f}s")
 
         # compute attention
+        if profile:
+            t0 = time.perf_counter()
         x = flash_attention(q, k, v, k_lens=context_lens)
+        if profile:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            logging.debug(f"WanT2VCrossAttention: flash_attention time: {time.perf_counter()-t0:.6f}s")
 
         # output
         x = x.flatten(2)
@@ -199,7 +227,7 @@ class WanI2VCrossAttention(WanSelfAttention):
         # self.alpha = nn.Parameter(torch.zeros((1, )))
         self.norm_k_img = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
-    def forward(self, x, context, context_lens):
+    def forward(self, x, context, context_lens, profile: bool = False):
         r"""
         Args:
             x(Tensor): Shape [B, L1, C]
@@ -212,14 +240,34 @@ class WanI2VCrossAttention(WanSelfAttention):
         b, n, d = x.size(0), self.num_heads, self.head_dim
 
         # compute query, key, value
+        if profile:
+            t0 = time.perf_counter()
         q = self.norm_q(self.q(x)).view(b, -1, n, d)
         k = self.norm_k(self.k(context)).view(b, -1, n, d)
         v = self.v(context).view(b, -1, n, d)
         k_img = self.norm_k_img(self.k_img(context_img)).view(b, -1, n, d)
         v_img = self.v_img(context_img).view(b, -1, n, d)
+        if profile:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            logging.debug(f"WanI2VCrossAttention: qkv time: {time.perf_counter()-t0:.6f}s")
+
+        if profile:
+            t0 = time.perf_counter()
         img_x = flash_attention(q, k_img, v_img, k_lens=None)
+        if profile:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            logging.debug(f"WanI2VCrossAttention: img flash_attention time: {time.perf_counter()-t0:.6f}s")
+
         # compute attention
+        if profile:
+            t0 = time.perf_counter()
         x = flash_attention(q, k, v, k_lens=context_lens)
+        if profile:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            logging.debug(f"WanI2VCrossAttention: text flash_attention time: {time.perf_counter()-t0:.6f}s")
 
         # output
         x = x.flatten(2)
@@ -284,6 +332,7 @@ class WanAttentionBlock(nn.Module):
         freqs,
         context,
         context_lens,
+        profile: bool = False,
     ):
         r"""
         Args:
@@ -301,13 +350,13 @@ class WanAttentionBlock(nn.Module):
         # self-attention
         y = self.self_attn(
             self.norm1(x).float() * (1 + e[1]) + e[0], seq_lens, grid_sizes,
-            freqs)
+            freqs, profile=profile)
         with amp.autocast(dtype=torch.float32):
             x = x + y * e[2]
 
         # cross-attention & ffn function
         def cross_attn_ffn(x, context, context_lens, e):
-            x = x + self.cross_attn(self.norm3(x), context, context_lens)
+            x = x + self.cross_attn(self.norm3(x), context, context_lens, profile=profile)
             y = self.ffn(self.norm2(x).float() * (1 + e[4]) + e[3])
             with amp.autocast(dtype=torch.float32):
                 x = x + y * e[5]
@@ -340,10 +389,20 @@ class Head(nn.Module):
             x(Tensor): Shape [B, L1, C]
             e(Tensor): Shape [B, C]
         """
+        return self._forward(x, e)
+
+    def _forward(self, x, e, profile: bool = False):
+        """Internal forward that optionally accepts profiling flag."""
+        if profile:
+            t0 = time.perf_counter()
         assert e.dtype == torch.float32
         with amp.autocast(dtype=torch.float32):
             e = (self.modulation + e.unsqueeze(1)).chunk(2, dim=1)
             x = (self.head(self.norm(x) * (1 + e[1]) + e[0]))
+        if profile:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            logging.debug(f"Head: linear head time: {time.perf_counter()-t0:.6f}s")
         return x
 
 
@@ -498,6 +557,7 @@ class WanModel(ModelMixin, ConfigMixin):
         seq_len,
         clip_fea=None,
         y=None,
+        profile: bool = False,
     ):
         r"""
         Forward pass through the diffusion model
@@ -572,10 +632,11 @@ class WanModel(ModelMixin, ConfigMixin):
             context_lens=context_lens)
 
         for block in self.blocks:
-            x = block(x, **kwargs)
+            x = block(x, **kwargs, profile=profile)
 
         # head
-        x = self.head(x, e)
+        # call internal _forward to allow profiling without changing head external API
+        x = self.head._forward(x, e, profile=profile)
 
         # unpatchify
         x = self.unpatchify(x, grid_sizes)
